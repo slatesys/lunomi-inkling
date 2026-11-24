@@ -2521,7 +2521,7 @@ void launch_q8p(Q8Planes w, const Q81Block* x, float* y, int n_in, int n_out, in
         launch_pdl(native_q8p_mma_kernel, dim3(unsigned((n_out + 15) / 16)), dim3(256), 0, s, w, x, y, n_in, n_out, ncols);
         return;
     }
-    if (kQ8pRows > 1) {   // Lunomi: several rows a block, the same bits
+    if (kQ8pRows > 1 && ncols == 3) {   // Lunomi: several rows a block, the same bits (measured: wins at 3 columns only)
         const dim3 gr{unsigned((n_out + kQ8pRows - 1) / kQ8pRows)};
         switch (ncols) {
         case 2: launch_pdl(native_q8p_rows_kernel<2, 3>, gr, threads, 0, s, w, x, y, n_in, n_out); break;
@@ -2589,7 +2589,7 @@ void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q8
     int sum_rows = 0;
     for (int i = 0; i < seg.n; ++i) sum_rows += seg.n_out[i];
     const bool mma = mmvq_mma_sms() != 0 && ((sum_rows >= 65536 && ncols >= 4) || (sum_rows >= 4096 && ncols >= 7));
-    const int rows_a_block = mma ? 16 : (ncols >= 2 && kQ8pRows > 1) ? kQ8pRows : 1;   // Lunomi: kQ8pRows for columns
+    const int rows_a_block = mma ? 16 : (ncols == 3 && kQ8pRows > 1) ? kQ8pRows : 1;   // Lunomi: kQ8pRows at 3 columns (measured)
     SegArgs a{};
     int end = 0;
     for (int i = 0; i < 3; ++i) {
