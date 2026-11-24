@@ -31,6 +31,7 @@ Measured on a host-capped 400 W RTX 5090 (stock is 575 W), 262,144-token context
 | Change | Effect | Quality |
 |---|---|---|
 | Small-tile router kernel for short prompts (`src/kernels/cuda/dense_ops.cu`) | Time to first token −3 ms on short prompts; long prompts unchanged | Lossless: greedy output byte-identical on 8 prompts up to 12K tokens |
+| Dense Q8 linears: two output rows per block for 3-token verify windows (`src/kernels/cuda/native_mmvq.cu`) | Step time −1.8% on 3-token windows (the most common), −0.7% overall (RTX PRO 6000, 16,000+ windows) | Lossless: byte-identical, each row keeps its summation order |
 | Serving settings (`--answer-room 0`, full 262K context) | The model's thinking is never cut short; no speed cost for the long context | Same as the official serving (see the recipe) |
 
 Every change is lossless or labelled. Each is one commit on top of the pinned base, so it can be reviewed, reverted or
