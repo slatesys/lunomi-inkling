@@ -274,6 +274,53 @@ __global__ void __launch_bounds__(128) f32_rows_dot_kernel(const float* __restri
         }
 }
 
+// The same product for small T x N (a short prompt's router: T ~ 300, N = 128 gives f32_rows_dot_kernel only 20 blocks on
+// a 170-SM card): a block of 64 threads per 16 rows x 16 outputs, each thread 1 row x 4 outputs, K in steps of 16. Every
+// output still sums fmaf(x[k], w[k], acc) in k order from zero, so the result is bit-identical to f32_rows_dot_kernel's.
+constexpr int FS_T = 16, FS_N = 16, FS_K = 64;
+__global__ void __launch_bounds__(64) f32_rows_dot_small_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                                                float* __restrict__ y, int64_t T, int64_t N, int64_t K) {
+    __shared__ __align__(16) float xs[FS_K][FS_T + 4];
+    __shared__ __align__(16) float ws[FS_K][FS_N + 4];
+    const int tid = threadIdx.x, tr = tid / (FS_N / 4), tc = tid % (FS_N / 4);
+    const int64_t t0 = (int64_t) blockIdx.x * FS_T, n0 = (int64_t) blockIdx.y * FS_N;
+    float acc[4] = {};
+    const int lr = tid / 4, lk0 = (tid % 4) * 4;   // four float4 of x and four of w per thread per K step
+    for (int64_t k0 = 0; k0 < K; k0 += FS_K) {
+#pragma unroll
+        for (int h = 0; h < FS_K / 16; ++h) {
+            const int lk = lk0 + 16 * h;
+            const float4 v = *reinterpret_cast<const float4*>(x + min(t0 + lr, T - 1) * K + k0 + lk);
+            xs[lk][lr] = v.x;
+            xs[lk + 1][lr] = v.y;
+            xs[lk + 2][lr] = v.z;
+            xs[lk + 3][lr] = v.w;
+            const float4 u = *reinterpret_cast<const float4*>(w + min(n0 + lr, N - 1) * K + k0 + lk);
+            ws[lk][lr] = u.x;
+            ws[lk + 1][lr] = u.y;
+            ws[lk + 2][lr] = u.z;
+            ws[lk + 3][lr] = u.w;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < FS_K; ++k) {
+            const float a = xs[k][tr];
+            const float4 b = *reinterpret_cast<const float4*>(&ws[k][tc * 4]);
+            acc[0] = fmaf(a, b.x, acc[0]);
+            acc[1] = fmaf(a, b.y, acc[1]);
+            acc[2] = fmaf(a, b.z, acc[2]);
+            acc[3] = fmaf(a, b.w, acc[3]);
+        }
+        __syncthreads();
+    }
+    const int64_t t = t0 + tr;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int64_t n = n0 + tc * 4 + j;
+        if (t < T && n < N) y[t * N + n] = acc[j];
+    }
+}
+
 // The GDN a/b projections of a prompt chunk with the gates fused: a and b are the first and last HV (= 48) rows of w
 // [2 HV][K] (BF16), gate[t][h] = softplus(a + dt[h]) * ssm_a[h], beta[t][h] = sigmoid(b) - the expressions of gdn_gates.
 // The product runs on BF16 tensor cores (m16n8k16): x is split into two BF16 terms (hi + lo, about 17 bits of x; the BF16
@@ -727,6 +774,13 @@ void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64
 void f32_rows_dot(const float* x, const float* w, float* y, int64_t T, int64_t N, int64_t K, void* stream) {
     if (T <= 0) return;
     if (K % FD_K != 0) { basalt::log::error("basalt", "f32_rows_dot: K %lld", (long long) K); std::exit(1); }
+    const int64_t big_blocks = ((T + FD_T - 1) / FD_T) * ((N + FD_N - 1) / FD_N);
+    if (big_blocks < 128 && K % FS_K == 0) {   // too few blocks to fill the card: the small tiling, same bits
+        f32_rows_dot_small_kernel<<<dim3((unsigned) ((T + FS_T - 1) / FS_T), (unsigned) ((N + FS_N - 1) / FS_N)), 64, 0,
+                                    (cudaStream_t) stream>>>(x, w, y, T, N, K);
+        check("f32_rows_dot");
+        return;
+    }
     f32_rows_dot_kernel<<<dim3((unsigned) ((T + FD_T - 1) / FD_T), (unsigned) ((N + FD_N - 1) / FD_N)), 128, 0,
                           (cudaStream_t) stream>>>(x, w, y, T, N, K);
     check("f32_rows_dot");
