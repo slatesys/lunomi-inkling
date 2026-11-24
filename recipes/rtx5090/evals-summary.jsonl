@@ -1,0 +1,5 @@
+{"suite": "gsm8k", "tag": "smoke", "n": 16, "acc": 1.0, "correct": 16, "truncated": 0, "errors": 0, "effort": "low", "max_tokens": 3072, "completion_tokens": 4082, "wall_s": 10.2, "time": "00:54:57"}
+{"suite": "gsm8k", "tag": "basalt-recipe", "n": 1319, "acc": 0.9651, "correct": 1273, "truncated": 0, "errors": 0, "effort": "low", "max_tokens": 3072, "completion_tokens": 330356, "wall_s": 533.0, "time": "01:04:28"}
+{"suite": "humaneval", "tag": "basalt-recipe", "n": 164, "acc": 0.9512, "correct": 156, "truncated": 1, "errors": 0, "effort": "low", "max_tokens": 4096, "completion_tokens": 87861, "wall_s": 142.4, "time": "01:06:50"}
+{"suite": "gsm8k", "tag": "vllm-best", "n": 1319, "acc": 0.9666, "correct": 1275, "truncated": 0, "errors": 0, "effort": "low", "max_tokens": 3072, "completion_tokens": 332130, "wall_s": 303.1, "time": "01:12:20"}
+{"suite": "humaneval", "tag": "vllm-best", "n": 164, "acc": 0.9634, "correct": 158, "truncated": 1, "errors": 0, "effort": "low", "max_tokens": 4096, "completion_tokens": 90523, "wall_s": 102.2, "time": "01:14:02"}
