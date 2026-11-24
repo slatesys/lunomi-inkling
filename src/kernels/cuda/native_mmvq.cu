@@ -2272,12 +2272,12 @@ __host__ __device__ __forceinline__ Q8Planes q8p_offset(Q8Planes p, int row0, in
     return {p.codes + std::size_t(row0) * n_in, p.scales + std::size_t(row0) * (n_in / 32)};
 }
 
-template<bool SmallK, int NCOLS, int NPRE>
+template<bool SmallK, int NCOLS, int NPRE, int RB = 1>
 __device__ __forceinline__ void small_q8p_body(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y,
                                                int n_in, int n_out, int bx) {
-    static_assert(NCOLS == 1 || !SmallK, "columns take the one-row layout");
+    static_assert(NCOLS == 1 || !SmallK, "columns take the one-row layout");   // Lunomi: RB rows a block for columns instead
     constexpr int Qi = 8;
-    constexpr int ROWS = SmallK ? WARPS : 1;
+    constexpr int ROWS = SmallK ? WARPS : RB;
     constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row0 = ROWS * bx;
@@ -2373,11 +2373,29 @@ __global__ void native_q8p_kernel(Q8Planes w, const Q81Block* __restrict__ x, fl
     small_q8p_body<SmallK, NCOLS, NPRE>(w, x, y, n_in, n_out, int(blockIdx.x));
 }
 
+// Lunomi: kQ8pRows output rows a block for 2-8 columns (a decode window's rows), instead of one. Each row's sum keeps its
+// order (a thread's k steps, then the warps in order, then the warp tree), so the bits are native_q8p_kernel's; a block
+// keeps more weight bytes in flight and the grid has kQ8pRows times fewer blocks.
+constexpr int kQ8pRows = 2;
+template<int NCOLS, int NPRE>
+__launch_bounds__(WARPS * WARP, 4)
+__global__ void native_q8p_rows_kernel(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y, int n_in, int n_out) {
+    small_q8p_body<false, NCOLS, NPRE, kQ8pRows>(w, x, y, n_in, n_out, int(blockIdx.x));
+}
+
 template<int NCOLS, int NPRE>
 __launch_bounds__(WARPS * WARP, NCOLS > 1 ? (NPRE > 0 ? 8 : 4) : 1)
 __global__ void native_q8p_seg_kernel(Q8Planes w, SegArgs a, int n_in) {
     const SegPick p = seg_pick(a);
     small_q8p_body<false, NCOLS, NPRE>(q8p_offset(w, p.row0, n_in), p.x, p.y, n_in, p.n_out, p.bx);
+}
+
+// Lunomi: native_q8p_seg_kernel with kQ8pRows rows a block (the segment's blocks are counted in kQ8pRows rows)
+template<int NCOLS, int NPRE>
+__launch_bounds__(WARPS * WARP, 4)
+__global__ void native_q8p_seg_rows_kernel(Q8Planes w, SegArgs a, int n_in) {
+    const SegPick p = seg_pick(a);
+    small_q8p_body<false, NCOLS, NPRE, kQ8pRows>(q8p_offset(w, p.row0, n_in), p.x, p.y, n_in, p.n_out, p.bx);
 }
 
 __device__ __forceinline__ void q8p_mma_body(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y,
@@ -2503,6 +2521,19 @@ void launch_q8p(Q8Planes w, const Q81Block* x, float* y, int n_in, int n_out, in
         launch_pdl(native_q8p_mma_kernel, dim3(unsigned((n_out + 15) / 16)), dim3(256), 0, s, w, x, y, n_in, n_out, ncols);
         return;
     }
+    if (kQ8pRows > 1 && ncols == 3) {   // Lunomi: several rows a block, the same bits (measured: wins at 3 columns only)
+        const dim3 gr{unsigned((n_out + kQ8pRows - 1) / kQ8pRows)};
+        switch (ncols) {
+        case 2: launch_pdl(native_q8p_rows_kernel<2, 3>, gr, threads, 0, s, w, x, y, n_in, n_out); break;
+        case 3: launch_pdl(native_q8p_rows_kernel<3, 3>, gr, threads, 0, s, w, x, y, n_in, n_out); break;
+        case 4: launch_pdl(native_q8p_rows_kernel<4, 0>, gr, threads, 0, s, w, x, y, n_in, n_out); break;
+        case 5: launch_pdl(native_q8p_rows_kernel<5, 0>, gr, threads, 0, s, w, x, y, n_in, n_out); break;
+        case 6: launch_pdl(native_q8p_rows_kernel<6, 0>, gr, threads, 0, s, w, x, y, n_in, n_out); break;
+        case 7: launch_pdl(native_q8p_rows_kernel<7, 0>, gr, threads, 0, s, w, x, y, n_in, n_out); break;
+        default: launch_pdl(native_q8p_rows_kernel<8, 0>, gr, threads, 0, s, w, x, y, n_in, n_out); break;
+        }
+        return;
+    }
     const dim3 grid{unsigned(n_out)};
     switch (ncols) {
     case 2: launch_pdl(native_q8p_kernel<false, 2, 3>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
@@ -2558,7 +2589,7 @@ void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q8
     int sum_rows = 0;
     for (int i = 0; i < seg.n; ++i) sum_rows += seg.n_out[i];
     const bool mma = mmvq_mma_sms() != 0 && ((sum_rows >= 65536 && ncols >= 4) || (sum_rows >= 4096 && ncols >= 7));
-    const int rows_a_block = mma ? 16 : 1;
+    const int rows_a_block = mma ? 16 : (ncols == 3 && kQ8pRows > 1) ? kQ8pRows : 1;   // Lunomi: kQ8pRows at 3 columns (measured)
     SegArgs a{};
     int end = 0;
     for (int i = 0; i < 3; ++i) {
@@ -2573,6 +2604,19 @@ void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q8
     const dim3 grid{unsigned(end)}, threads(WARP, WARPS);
     if (mma) {
         launch_pdl(native_q8p_mma_seg_kernel, grid, dim3(256), 0, s, w, a, n_in, ncols);
+        launch_check();
+        return;
+    }
+    if (rows_a_block > 1) {   // Lunomi: kQ8pRows rows a block, the same bits
+        switch (ncols) {
+        case 2: launch_pdl(native_q8p_seg_rows_kernel<2, 3>, grid, threads, 0, s, w, a, n_in); break;
+        case 3: launch_pdl(native_q8p_seg_rows_kernel<3, 3>, grid, threads, 0, s, w, a, n_in); break;
+        case 4: launch_pdl(native_q8p_seg_rows_kernel<4, 0>, grid, threads, 0, s, w, a, n_in); break;
+        case 5: launch_pdl(native_q8p_seg_rows_kernel<5, 0>, grid, threads, 0, s, w, a, n_in); break;
+        case 6: launch_pdl(native_q8p_seg_rows_kernel<6, 0>, grid, threads, 0, s, w, a, n_in); break;
+        case 7: launch_pdl(native_q8p_seg_rows_kernel<7, 0>, grid, threads, 0, s, w, a, n_in); break;
+        default: launch_pdl(native_q8p_seg_rows_kernel<8, 0>, grid, threads, 0, s, w, a, n_in); break;
+        }
         launch_check();
         return;
     }
